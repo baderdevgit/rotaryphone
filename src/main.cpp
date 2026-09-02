@@ -24,6 +24,9 @@ const int NBLOX = 4;
 
 const char* COUNTER_FILE = "COUNTER.TXT";
 
+// how long to wait after the last digit before treating what's typed as submitted
+const unsigned long DIGIT_TIMEOUT_MS = 1500;
+
 bool MODE; //0 is playback mode, 1 is recording mode
 RecordingState state = RecordingState::Idle;
 
@@ -45,7 +48,10 @@ byte colPins[COLS] = {5, 6, 9};         // C1, C2, C3
 
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
-// Playback path: SD card -> promptPlayer -> I2S output (the shield's codec)
+// Playback path: SD card -> promptPlayer -> I2S output (the shield's codec).
+// Shared by the recording-mode prompt/beep and playback-mode announcements/
+// recordings - safe because MODE gates which flow is active, so they never
+// run at the same time.
 AudioPlaySdWav promptPlayer;
 AudioOutputI2S audioOutput;
 AudioConnection patchCordL(promptPlayer, 0, audioOutput, 0);
@@ -63,6 +69,20 @@ uint32_t recByteSaved = 0;
 uint32_t nextRecordingId = 0;
 char recordingFilename[13]; // "RECxxxxx.WAV" (8.3 filename) + null terminator
 
+// --- playback mode state ---
+bool playbackActive = false;   // true while the phone is off-hook in playback mode
+int currentFileIndex = -1;     // 0-based id of the last file played; -1 = none yet
+
+const int MAX_QUEUE = 10;
+char audioQueue[MAX_QUEUE][13];
+int audioQueueLength = 0;
+int audioQueueIndex = 0;
+bool audioQueueActive = false;
+
+char digitBuffer[6]; // up to 5 digits + null
+uint8_t digitCount = 0;
+unsigned long lastDigitPressTime = 0;
+
 void OnPhoneButtonPickedUp();
 void OnPhoneButtonPutDown();
 void PlayPrompt();
@@ -72,6 +92,16 @@ void SaveNextRecordingId(uint32_t id);
 void StartRecording();
 void ContinueRecording();
 void StopRecording();
+void ClearAudioQueue();
+void EnqueueAudio(const char* filename);
+void StartAudioQueue();
+void UpdateAudioQueue();
+void EnqueueNumberDigits(uint32_t number);
+void AnnounceAvailableCount();
+void PlaySelectedRecording(uint32_t selection);
+void PlayAdjacentRecording(int direction);
+void HandlePlaybackKeypad();
+void CheckDigitTimeout();
 
 void setup() {
   Serial.begin(9600);
@@ -115,14 +145,6 @@ void loop() {
     MODE = true;
   }
 
-  if(MODE == false) { //playback mode logic
-    char key = keypad.getKey();
-    if (key) {
-      Serial.print("Keypad: ");
-      Serial.println(key);
-    }
-  }
-
   // advance the recording-mode state machine once the current audio finishes
   if (state == RecordingState::PlayingPrompt && !promptPlayer.isPlaying()) {
     //prompt finished -> next is the beep (not implemented yet)
@@ -133,6 +155,14 @@ void loop() {
   if (state == RecordingState::Recording) {
     ContinueRecording();
   }
+
+  // playback mode: keep the queued announcement/recording moving forward,
+  // and keep listening for a keypress the whole time so it can interrupt
+  if (playbackActive) {
+    UpdateAudioQueue();
+    HandlePlaybackKeypad();
+    CheckDigitTimeout();
+  }
 }
 
 void OnPhoneButtonPickedUp() {
@@ -141,6 +171,13 @@ void OnPhoneButtonPickedUp() {
     if(state == RecordingState::Idle) {
       PlayPrompt();
     }
+  }
+  else //playback mode
+  {
+    playbackActive = true;
+    currentFileIndex = -1;
+    digitCount = 0;
+    AnnounceAvailableCount();
   }
 }
 
@@ -162,6 +199,13 @@ void OnPhoneButtonPutDown() {
     } else {
       state = RecordingState::Idle;
     }
+  }
+  else //playback mode
+  {
+    promptPlayer.stop();
+    ClearAudioQueue();
+    digitCount = 0;
+    playbackActive = false;
   }
 }
 
@@ -277,4 +321,142 @@ void StopRecording() {
 
   nextRecordingId++;
   SaveNextRecordingId(nextRecordingId);
+}
+
+// --- playback mode ---
+
+// A small non-blocking playlist: EnqueueAudio() while building up what to
+// say, then StartAudioQueue() once, then UpdateAudioQueue() every loop pass
+// advances to the next file automatically once the current one finishes.
+// This (rather than PlayPrompt's blocking style) is what lets a keypress
+// interrupt playback - loop() never stops polling the keypad while it plays.
+
+void ClearAudioQueue() {
+  audioQueueLength = 0;
+  audioQueueIndex = 0;
+  audioQueueActive = false;
+}
+
+void EnqueueAudio(const char* filename) {
+  if (audioQueueLength < MAX_QUEUE) {
+    snprintf(audioQueue[audioQueueLength], sizeof(audioQueue[0]), "%s", filename);
+    audioQueueLength++;
+  }
+}
+
+void StartAudioQueue() {
+  audioQueueIndex = 0;
+  if (audioQueueLength > 0) {
+    audioQueueActive = true;
+    promptPlayer.play(audioQueue[0]);
+  } else {
+    audioQueueActive = false;
+  }
+}
+
+void UpdateAudioQueue() {
+  if (!audioQueueActive || promptPlayer.isPlaying()) {
+    return;
+  }
+
+  audioQueueIndex++;
+  if (audioQueueIndex < audioQueueLength) {
+    promptPlayer.play(audioQueue[audioQueueIndex]);
+  } else {
+    audioQueueActive = false;
+  }
+}
+
+// Spells a number out digit by digit using 0.WAV..9.WAV (no text-to-speech
+// available, so "12" is announced as "one" "two", not "twelve").
+void EnqueueNumberDigits(uint32_t number) {
+  char digits[11];
+  snprintf(digits, sizeof(digits), "%lu", (unsigned long)number);
+  for (int i = 0; digits[i] != '\0'; i++) {
+    char filename[8];
+    snprintf(filename, sizeof(filename), "%c.WAV", digits[i]);
+    EnqueueAudio(filename);
+  }
+}
+
+// "There are" + <digits of nextRecordingId> + "recordings available"
+void AnnounceAvailableCount() {
+  ClearAudioQueue();
+  EnqueueAudio("COUNT.WAV");
+  EnqueueNumberDigits(nextRecordingId);
+  EnqueueAudio("AVAIL.WAV");
+  StartAudioQueue();
+}
+
+// selection is 1-indexed as typed by the caller (recording #1 == REC00000.WAV)
+void PlaySelectedRecording(uint32_t selection) {
+  ClearAudioQueue();
+
+  if (selection < 1 || selection > nextRecordingId) {
+    EnqueueNumberDigits(selection);
+    EnqueueAudio("NOTAVAIL.WAV");
+  } else {
+    currentFileIndex = selection - 1;
+    EnqueueAudio("PLAYING.WAV");
+    EnqueueNumberDigits(selection);
+
+    char filename[13];
+    snprintf(filename, sizeof(filename), "REC%05lu.WAV", (unsigned long)currentFileIndex);
+    EnqueueAudio(filename);
+  }
+
+  StartAudioQueue();
+}
+
+// direction: -1 for '*' (previous), +1 for '#' (next). Wraps around, and
+// plays the file directly with no "Playing audio file X" announcement.
+void PlayAdjacentRecording(int direction) {
+  if (nextRecordingId == 0) {
+    return; // nothing recorded yet
+  }
+
+  if (currentFileIndex < 0) {
+    currentFileIndex = (direction > 0) ? 0 : (int)(nextRecordingId - 1);
+  } else {
+    currentFileIndex = ((currentFileIndex + direction) % (int)nextRecordingId + (int)nextRecordingId) % (int)nextRecordingId;
+  }
+
+  ClearAudioQueue();
+  char filename[13];
+  snprintf(filename, sizeof(filename), "REC%05lu.WAV", (unsigned long)currentFileIndex);
+  EnqueueAudio(filename);
+  StartAudioQueue();
+}
+
+void HandlePlaybackKeypad() {
+  char key = keypad.getKey();
+  if (!key) {
+    return;
+  }
+
+  // any keypress cuts off whatever's currently playing
+  if (audioQueueActive) {
+    promptPlayer.stop();
+    ClearAudioQueue();
+  }
+
+  if (key == '*' || key == '#') {
+    digitCount = 0; // discard any number that was being typed
+    PlayAdjacentRecording(key == '#' ? 1 : -1);
+    return;
+  }
+
+  if (key >= '0' && key <= '9' && digitCount < sizeof(digitBuffer) - 1) {
+    digitBuffer[digitCount++] = key;
+    digitBuffer[digitCount] = '\0';
+    lastDigitPressTime = millis();
+  }
+}
+
+void CheckDigitTimeout() {
+  if (digitCount > 0 && millis() - lastDigitPressTime >= DIGIT_TIMEOUT_MS) {
+    uint32_t selection = atoi(digitBuffer);
+    digitCount = 0;
+    PlaySelectedRecording(selection);
+  }
 }
