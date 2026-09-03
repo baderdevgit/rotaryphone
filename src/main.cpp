@@ -57,10 +57,15 @@ AudioOutputI2S audioOutput;
 AudioConnection patchCordL(promptPlayer, 0, audioOutput, 0);
 AudioConnection patchCordR(promptPlayer, 1, audioOutput, 1);
 
-// Recording path: I2S input (mic) -> recordQueue -> we drain it to SD ourselves
+// Recording path: I2S input (mic, wired to LINE_IN R = channel 1) -> highpass
+// filter (cuts hum/buzz below the filter's cutoff) -> recordQueue -> we drain
+// it to SD ourselves. Mic is a carbon capsule from a rotary phone, biased
+// through an external resistor/capacitor circuit into LINE_IN.
 AudioInputI2S audioInput;
+AudioFilterBiquad recordFilter;
 AudioRecordQueue recordQueue;
-AudioConnection patchCordRecordIn(audioInput, 0, recordQueue, 0);
+AudioConnection patchCordRecordIn(audioInput, 1, recordFilter, 0);
+AudioConnection patchCordRecordFiltered(recordFilter, 0, recordQueue, 0);
 
 AudioControlSGTL5000 sgtl5000;
 
@@ -90,8 +95,10 @@ void WriteWavHeader(File &f, uint32_t dataBytes);
 uint32_t LoadNextRecordingId();
 void SaveNextRecordingId(uint32_t id);
 void StartRecording();
+void AmplifySamples(int16_t* samples, size_t count);
 void ContinueRecording();
 void StopRecording();
+void DiscardRecording();
 void ClearAudioQueue();
 void EnqueueAudio(const char* filename);
 void StartAudioQueue();
@@ -102,6 +109,7 @@ void PlaySelectedRecording(uint32_t selection);
 void PlayAdjacentRecording(int direction);
 void HandlePlaybackKeypad();
 void CheckDigitTimeout();
+bool PlayFile(const char* filename);
 
 void setup() {
   Serial.begin(9600);
@@ -114,34 +122,63 @@ void setup() {
   hookSwitch.attach(SWITCH_PIN);
   hookSwitch.interval(10);
   MODE = hookSwitch.read();
+  Serial.print("Initial mode: ");
+  Serial.println(MODE ? "Recording" : "Playback");
 
   AudioMemory(60);
-  sgtl5000.enable();
-  sgtl5000.volume(0.5);
 
-  if (!SD.begin(SDCARD_CS_PIN)) {
-    Serial.println("SD card init failed - check SDCARD_CS_PIN");
+  // cuts hum/buzz below 200Hz, well under voice range, before recording
+  recordFilter.setHighpass(0, 200, 0.707);
+
+  if (sgtl5000.enable()) {
+    Serial.println("SGTL5000 codec enabled");
+  } else {
+    Serial.println("ERROR: SGTL5000 codec failed to enable - check I2C wiring/address");
+  }
+  // mic is a carbon capsule biased externally into LINE_IN, not the codec's mic-preamp input
+  sgtl5000.inputSelect(AUDIO_INPUT_LINEIN);
+  sgtl5000.lineInLevel(15); // max input gain - the bias circuit's signal swing is small, default (5) was too quiet
+  sgtl5000.volume(1);
+
+  if (SD.begin(SDCARD_CS_PIN)) {
+    Serial.println("SD card init OK");
+  } else {
+    Serial.println("ERROR: SD card init failed - check SDCARD_CS_PIN");
   }
 
   nextRecordingId = LoadNextRecordingId();
+  Serial.print("nextRecordingId loaded: ");
+  Serial.println(nextRecordingId);
 }
 
 void loop() {
   //phone picked up or not
   phoneButton.update();
   if (phoneButton.changed() && phoneButton.read() == LOW) { //phone was picked up
+    Serial.println("Phone: picked up");
     OnPhoneButtonPickedUp();
   }
   else if(phoneButton.changed() && phoneButton.read() == HIGH){ //phone was set Down
+    Serial.println("Phone: put down");
     OnPhoneButtonPutDown();
   }
 
   //check if record switch changed
   hookSwitch.update();
   if (hookSwitch.changed() && hookSwitch.read() == LOW) { //Playback Mode
+    Serial.println("Mode: Playback");
+    if (state == RecordingState::Recording) {
+      Serial.println("Switched to playback mid-recording - discarding file");
+      DiscardRecording();
+    } else if (state != RecordingState::Idle) {
+      // mid prompt/beep, no file open yet - just stop and reset
+      promptPlayer.stop();
+      state = RecordingState::Idle;
+    }
     MODE = false;
   }
   else if(hookSwitch.changed() && hookSwitch.read() == HIGH) { //Recording Mode
+    Serial.println("Mode: Recording");
     MODE = true;
   }
 
@@ -209,17 +246,48 @@ void OnPhoneButtonPutDown() {
   }
 }
 
+// Plays filename through promptPlayer and logs whether it actually started.
+//
+// play() doesn't parse the WAV header synchronously - it sets an internal
+// "parsing" state and returns immediately; isPlaying() only becomes true a
+// few milliseconds later, once the header has actually been parsed on a
+// later audio-interrupt cycle. Checking isPlaying() right after play() would
+// misread "still starting up" as "already finished" and move on to the next
+// file, which stops this one before it ever makes a sound. isStopped() is
+// what actually distinguishes "still parsing" from "genuinely done/failed."
+bool PlayFile(const char* filename) {
+  Serial.print("Playing: ");
+  Serial.println(filename);
+
+  if (!SD.exists(filename)) {
+    Serial.print("  ERROR: file not found on SD: ");
+    Serial.println(filename);
+  }
+
+  promptPlayer.play(filename);
+
+  while (!promptPlayer.isPlaying() && !promptPlayer.isStopped()) {
+    // header still parsing, keep waiting (a few ms at most)
+  }
+
+  if (!promptPlayer.isPlaying()) {
+    Serial.println("  ERROR: playback did not start");
+    return false;
+  }
+  return true;
+}
+
 void PlayPrompt() {
   state = RecordingState::PlayingPrompt;
   // file must exist at the root of the SD card, 8.3 filename, PCM WAV
-  promptPlayer.play("PROMPT.WAV");
+  PlayFile("PROMPT.WAV");
 
   while (promptPlayer.isPlaying()) {
     // busy-wait until the file finishes
   }
 
   state = RecordingState::PlayingBeep;
-  promptPlayer.play("BEEP.WAV");
+  PlayFile("BEEP.WAV");
   while (promptPlayer.isPlaying()){
   }
 
@@ -294,15 +362,31 @@ void StartRecording() {
   recordQueue.begin();
 }
 
+// Digital gain applied to captured samples - hardware input gain (lineInLevel)
+// is already maxed, but the carbon-mic bias circuit's signal swing is still
+// quiet, so boost it here too. Tune this if recordings are too loud/clipped
+// (distorted) or still too quiet.
+const float RECORD_GAIN = 12.0;
+
+void AmplifySamples(int16_t* samples, size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    int32_t amplified = (int32_t)(samples[i] * RECORD_GAIN);
+    if (amplified > 32767) amplified = 32767;
+    if (amplified < -32768) amplified = -32768;
+    samples[i] = (int16_t)amplified;
+  }
+}
+
 void ContinueRecording() {
   if (recordQueue.available() >= NBLOX) {
-    byte buffer[NBLOX * AUDIO_BLOCK_SAMPLES * sizeof(int16_t)];
+    int16_t buffer[NBLOX * AUDIO_BLOCK_SAMPLES];
     for (int i = 0; i < NBLOX; i++) {
-      memcpy(buffer + i * AUDIO_BLOCK_SAMPLES * sizeof(int16_t),
+      memcpy(buffer + i * AUDIO_BLOCK_SAMPLES,
              recordQueue.readBuffer(), AUDIO_BLOCK_SAMPLES * sizeof(int16_t));
       recordQueue.freeBuffer();
     }
-    frec.write(buffer, sizeof(buffer));
+    AmplifySamples(buffer, NBLOX * AUDIO_BLOCK_SAMPLES);
+    frec.write((byte*)buffer, sizeof(buffer));
     recByteSaved += sizeof(buffer);
   }
 }
@@ -310,9 +394,12 @@ void ContinueRecording() {
 void StopRecording() {
   recordQueue.end();
   while (recordQueue.available() > 0) {
-    frec.write((byte*)recordQueue.readBuffer(), AUDIO_BLOCK_SAMPLES * sizeof(int16_t));
+    int16_t buffer[AUDIO_BLOCK_SAMPLES];
+    memcpy(buffer, recordQueue.readBuffer(), sizeof(buffer));
     recordQueue.freeBuffer();
-    recByteSaved += AUDIO_BLOCK_SAMPLES * sizeof(int16_t);
+    AmplifySamples(buffer, AUDIO_BLOCK_SAMPLES);
+    frec.write((byte*)buffer, sizeof(buffer));
+    recByteSaved += sizeof(buffer);
   }
 
   frec.seek(0);
@@ -321,6 +408,19 @@ void StopRecording() {
 
   nextRecordingId++;
   SaveNextRecordingId(nextRecordingId);
+}
+
+// Aborts an in-progress recording without saving it - drains and discards
+// whatever's left in the queue, closes and deletes the partial file, and
+// does NOT touch nextRecordingId/COUNTER_FILE since nothing was kept.
+void DiscardRecording() {
+  recordQueue.end();
+  while (recordQueue.available() > 0) {
+    recordQueue.freeBuffer();
+  }
+  frec.close();
+  SD.remove(recordingFilename);
+  state = RecordingState::Idle;
 }
 
 // --- playback mode ---
@@ -348,7 +448,7 @@ void StartAudioQueue() {
   audioQueueIndex = 0;
   if (audioQueueLength > 0) {
     audioQueueActive = true;
-    promptPlayer.play(audioQueue[0]);
+    PlayFile(audioQueue[0]);
   } else {
     audioQueueActive = false;
   }
@@ -361,7 +461,7 @@ void UpdateAudioQueue() {
 
   audioQueueIndex++;
   if (audioQueueIndex < audioQueueLength) {
-    promptPlayer.play(audioQueue[audioQueueIndex]);
+    PlayFile(audioQueue[audioQueueIndex]);
   } else {
     audioQueueActive = false;
   }
@@ -409,7 +509,7 @@ void PlaySelectedRecording(uint32_t selection) {
 }
 
 // direction: -1 for '*' (previous), +1 for '#' (next). Wraps around, and
-// plays the file directly with no "Playing audio file X" announcement.
+// announces "Playing" + the number before the recording, same as a typed selection.
 void PlayAdjacentRecording(int direction) {
   if (nextRecordingId == 0) {
     return; // nothing recorded yet
@@ -422,6 +522,9 @@ void PlayAdjacentRecording(int direction) {
   }
 
   ClearAudioQueue();
+  EnqueueAudio("PLAYING.WAV");
+  EnqueueNumberDigits(currentFileIndex + 1); // 1-indexed for the caller
+
   char filename[13];
   snprintf(filename, sizeof(filename), "REC%05lu.WAV", (unsigned long)currentFileIndex);
   EnqueueAudio(filename);
