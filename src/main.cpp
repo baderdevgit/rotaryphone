@@ -43,7 +43,7 @@ char keys[ROWS][COLS] = {
   {'*', '0', '#'}
 };
 
-byte rowPins[ROWS] = {14, 15, 17, 16};  // R1, R2, R3, R4
+byte rowPins[ROWS] = {14, 22, 17, 16};  // R1, R2, R3, R4 - R2 moved from pin 15 to 22
 byte colPins[COLS] = {5, 6, 9};         // C1, C2, C3
 
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
@@ -176,10 +176,31 @@ void loop() {
       state = RecordingState::Idle;
     }
     MODE = false;
+
+    // phone is already off the hook - start the playback session now
+    // instead of waiting for the next pickup
+    if (phoneButton.read() == LOW) {
+      playbackActive = true;
+      currentFileIndex = -1;
+      digitCount = 0;
+      AnnounceAvailableCount();
+    }
   }
   else if(hookSwitch.changed() && hookSwitch.read() == HIGH) { //Recording Mode
     Serial.println("Mode: Recording");
+    if (playbackActive) {
+      promptPlayer.stop();
+      ClearAudioQueue();
+      digitCount = 0;
+      playbackActive = false;
+    }
     MODE = true;
+
+    // phone is already off the hook - start the recording session now
+    // instead of waiting for the next pickup
+    if (phoneButton.read() == LOW) {
+      PlayPrompt();
+    }
   }
 
   // advance the recording-mode state machine once the current audio finishes
